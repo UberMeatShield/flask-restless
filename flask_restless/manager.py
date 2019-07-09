@@ -20,6 +20,7 @@ from flask import Blueprint
 
 from .helpers import primary_key_name
 from .helpers import url_for
+from .helpers import get_session, set_session
 from .views import API
 from .views import FunctionAPI
 
@@ -136,7 +137,7 @@ class APIManager(object):
         url_for.created_managers.append(self)
 
         self.flask_sqlalchemy_db = kw.pop('flask_sqlalchemy_db', None)
-        self.session = kw.pop('session', None)
+        set_session(kw.pop('session', None))
         if self.app is not None:
             self.init_app(self.app, **kw)
 
@@ -293,7 +294,7 @@ class APIManager(object):
             flask_sqlalchemy_db = self.flask_sqlalchemy_db
         # If the session was provided in the constructor, use that.
         if session is None:
-            session = self.session
+            session = get_session()
         session = session or getattr(flask_sqlalchemy_db, 'session', None)
         # Use the `extensions` dictionary on the provided Flask object to store
         # extension-specific information.
@@ -643,8 +644,14 @@ class APIManager(object):
                                    view_func=eval_api_view)
         # Finally, record that this APIManager instance has created an API for
         # the specified model.
-        self.created_apis_for[model] = APIInfo(collection_name, blueprint.name)
+        self.created_apis_for[model] = APIInfo(
+            collection_name,
+            blueprint.name,
+        )
         return blueprint
+
+    def reset_session(self, session):
+        set_session(session)
 
     def create_api(self, *args, **kw):
         """Creates and registers a ReSTful API blueprint on the

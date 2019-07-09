@@ -36,10 +36,8 @@ from flask import request
 from flask.views import MethodView
 from mimerender import FlaskMimeRender
 from sqlalchemy import Column
-from sqlalchemy.exc import DataError
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.associationproxy import AssociationProxy
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.orm.exc import MultipleResultsFound
@@ -66,6 +64,7 @@ from .helpers import strings_to_dates
 from .helpers import to_dict
 from .helpers import upper_keys
 from .helpers import get_related_association_proxy_model
+from .helpers import get_session
 from .search import create_query
 from .search import search
 
@@ -80,6 +79,12 @@ _HEADERS = '__restless_headers'
 #: String used internally as a dictionary key for passing status code
 #: information from view functions to the :func:`jsonpify` function.
 _STATUS = '__restless_status_code'
+
+CONFLICT_INDICATORS = (
+    'conflicts with',
+    'UNIQUE constraint failed',
+    'is not unique',
+)
 
 
 class ProcessingException(HTTPException):
@@ -188,12 +193,21 @@ def catch_integrity_errors(session):
             try:
                 return func(*args, **kw)
             # TODO should `sqlalchemy.exc.InvalidRequestError`s also be caught?
-            except (DataError, IntegrityError, ProgrammingError) as exception:
-                session.rollback()
+            except SQLAlchemyError as exception:
+                get_session().rollback()
+                status = 409 if is_conflict(exception) else 400
                 current_app.logger.exception(str(exception))
-                return dict(message=type(exception).__name__), 400
+                return dict(message=type(exception).__name__), status
         return wrapped
     return decorator
+
+
+def is_conflict(exception):
+    """Returns ``True`` if and only if the specified exception represents a
+    conflict in the database.
+    """
+    exception_string = str(exception)
+    return any(s in exception_string for s in CONFLICT_INDICATORS)
 
 
 def set_headers(response, headers):
@@ -461,7 +475,6 @@ class ModelView(MethodView):
 
         """
         super(ModelView, self).__init__(*args, **kw)
-        self.session = session
         self.model = model
 
     def query(self, model=None):
@@ -471,7 +484,7 @@ class ModelView(MethodView):
         class.
 
         """
-        return session_query(self.session, model or self.model)
+        return session_query(get_session(), model or self.model)
 
 
 class FunctionAPI(ModelView):
@@ -499,7 +512,7 @@ class FunctionAPI(ModelView):
             current_app.logger.exception(str(exception))
             return dict(message='Unable to decode data'), 400
         try:
-            result = evaluate_functions(self.session, self.model,
+            result = evaluate_functions(get_session(), self.model,
                                         data.get('functions', []))
             if not result:
                 return {}, 204
@@ -718,7 +731,7 @@ class API(ModelView):
         # need to manually decorate each of the view functions here.
         decorate = lambda name, f: setattr(self, name, f(getattr(self, name)))
         for method in ['get', 'post', 'patch', 'put', 'delete']:
-            decorate(method, catch_integrity_errors(self.session))
+            decorate(method, catch_integrity_errors(get_session()))
 
     def _get_column_name(self, column):
         """Retrieve a column name from a column attribute of SQLAlchemy
@@ -772,7 +785,7 @@ class API(ModelView):
         if isinstance(toadd, dict):
             toadd = [toadd]
         for dictionary in toadd or []:
-            subinst = get_or_create(self.session, submodel, dictionary)
+            subinst = get_or_create(get_session(), submodel, dictionary)
             try:
                 for instance in query:
                     getattr(instance, relationname).append(subinst)
@@ -810,13 +823,13 @@ class API(ModelView):
         for dictionary in toremove or []:
             remove = dictionary.pop('__delete__', False)
             if 'id' in dictionary:
-                subinst = get_by(self.session, submodel, dictionary['id'])
+                subinst = get_by(get_session(), submodel, dictionary['id'])
             else:
                 subinst = self.query(submodel).filter_by(**dictionary).first()
             for instance in query:
                 getattr(instance, relationname).remove(subinst)
             if remove:
-                self.session.delete(subinst)
+                get_session().delete(subinst)
 
     def _set_on_relation(self, query, relationname, toset=None):
         """Sets the value of the relation specified by `relationname` on each
@@ -843,9 +856,9 @@ class API(ModelView):
         """
         submodel = get_related_model(self.model, relationname)
         if isinstance(toset, list):
-            value = [get_or_create(self.session, submodel, d) for d in toset]
+            value = [get_or_create(get_session(), submodel, d) for d in toset]
         else:
-            value = get_or_create(self.session, submodel, toset)
+            value = get_or_create(get_session(), submodel, toset)
         for instance in query:
             setattr(instance, relationname, value)
 
@@ -913,7 +926,7 @@ class API(ModelView):
         :meth:`sqlalchemy.orm.session.Session.rollback`*.
 
         """
-        self.session.rollback()
+        get_session().rollback()
         errors = extract_error_messages(exception) or \
             'Could not determine specific validation errors'
         return dict(validation_errors=errors), 400
@@ -960,7 +973,7 @@ class API(ModelView):
         if isinstance(instances, list):
             num_results = len(instances)
         else:
-            num_results = count(self.session, instances)
+            num_results = count(get_session(), instances)
         results_per_page = self._compute_results_per_page()
         if results_per_page > 0:
             # get the page number (first page is page 1)
@@ -1038,7 +1051,7 @@ class API(ModelView):
             if type(data[col]) == list:
                 # model has several related objects
                 for subparams in data[col]:
-                    subinst = get_or_create(self.session, submodel,
+                    subinst = get_or_create(get_session(), submodel,
                                             subparams)
                     try:
                         getattr(instance, col).append(subinst)
@@ -1047,7 +1060,7 @@ class API(ModelView):
                         attribute[subinst.key] = subinst.value
             else:
                 # model has single related object
-                subinst = get_or_create(self.session, submodel,
+                subinst = get_or_create(get_session(), submodel,
                                         data[col])
                 setattr(instance, col, subinst)
 
@@ -1061,7 +1074,7 @@ class API(ModelView):
         :http:statuscode:`404`.
 
         """
-        inst = get_by(self.session, self.model, instid, self.primary_key)
+        inst = get_by(get_session(), self.model, instid, self.primary_key)
         if inst is None:
             return {_STATUS: 404}, 404
         return self._inst_to_dict(inst)
@@ -1169,7 +1182,7 @@ class API(ModelView):
 
         # perform a filtered search
         try:
-            result = search(self.session, self.model, search_params)
+            result = search(get_session(), self.model, search_params)
         except NoResultFound:
             return dict(message='No result found'), 404
         except MultipleResultsFound:
@@ -1249,7 +1262,7 @@ class API(ModelView):
             if temp_result is not None:
                 instid = temp_result
         # get the instance of the "main" model whose ID is instid
-        instance = get_by(self.session, self.model, instid, self.primary_key)
+        instance = get_by(get_session(), self.model, instid, self.primary_key)
         if instance is None:
             return {_STATUS: 404}, 404
         # If no relation is requested, just return the instance. Otherwise,
@@ -1263,7 +1276,7 @@ class API(ModelView):
             relations = frozenset(get_relations(related_model))
             deep = dict((r, {}) for r in relations)
             if relationinstid is not None:
-                related_value_instance = get_by(self.session, related_model,
+                related_value_instance = get_by(get_session(), related_model,
                                                 relationinstid)
                 if related_value_instance is None:
                     return {_STATUS: 404}, 404
@@ -1311,7 +1324,7 @@ class API(ModelView):
             #     sqlalchemy.exc.InvalidRequestError: Can't call Query.delete()
             #     when order_by() has been called
             #
-            result = search(self.session, self.model, search_params,
+            result = search(get_session(), self.model, search_params,
                             _ignore_order_by=True)
         except NoResultFound:
             return dict(message='No result found'), 404
@@ -1331,9 +1344,9 @@ class API(ModelView):
             # below.
             num_deleted = result.delete(synchronize_session=False)
         else:
-            self.session.delete(result)
+            get_session().delete(result)
             num_deleted = 1
-        self.session.commit()
+        get_session().commit()
         result = dict(num_deleted=num_deleted)
         for postprocessor in self.postprocessors['DELETE_MANY']:
             postprocessor(result=result, search_params=search_params)
@@ -1371,7 +1384,7 @@ class API(ModelView):
             # See the note under the preprocessor in the get() method.
             if temp_result is not None:
                 instid = temp_result
-        inst = get_by(self.session, self.model, instid, self.primary_key)
+        inst = get_by(get_session(), self.model, instid, self.primary_key)
         if relationname:
             # If the request is ``DELETE /api/person/1/computers``, error 400.
             if not relationinstid:
@@ -1381,15 +1394,15 @@ class API(ModelView):
             # Otherwise, get the related instance to delete.
             relation = getattr(inst, relationname)
             related_model = get_related_model(self.model, relationname)
-            relation_instance = get_by(self.session, related_model,
+            relation_instance = get_by(get_session(), related_model,
                                        relationinstid)
             # Removes an object from the relation list.
             relation.remove(relation_instance)
-            was_deleted = len(self.session.dirty) > 0
+            was_deleted = len(get_session().dirty) > 0
         elif inst is not None:
-            self.session.delete(inst)
-            was_deleted = len(self.session.deleted) > 0
-        self.session.commit()
+            get_session().delete(inst)
+            was_deleted = len(get_session().deleted) > 0
+        get_session().commit()
         for postprocessor in self.postprocessors['DELETE_SINGLE']:
             postprocessor(was_deleted=was_deleted)
         return {}, 204 if was_deleted else 404
@@ -1446,8 +1459,8 @@ class API(ModelView):
             # model.
             instance = self.deserialize(data)
             # Add the created model to the session.
-            self.session.add(instance)
-            self.session.commit()
+            get_session().add(instance)
+            get_session().commit()
             # Get the dictionary representation of the new instance as it
             # appears in the database.
             result = self.serialize(instance)
@@ -1545,13 +1558,13 @@ class API(ModelView):
         if patchmany:
             try:
                 # create a SQLALchemy Query from the query parameter `q`
-                query = create_query(self.session, self.model, search_params)
+                query = create_query(get_session(), self.model, search_params)
             except Exception as exception:
                 current_app.logger.exception(str(exception))
                 return dict(message='Unable to construct query'), 400
         else:
             # create a SQLAlchemy Query which has exactly the specified row
-            query = query_by_primary_key(self.session, self.model, instid,
+            query = query_by_primary_key(get_session(), self.model, instid,
                                          self.primary_key)
             if query.count() == 0:
                 return {_STATUS: 404}, 404
@@ -1577,7 +1590,7 @@ class API(ModelView):
                     for field, value in data.items():
                         setattr(item, field, value)
                     num_modified += 1
-            self.session.commit()
+            get_session().commit()
         except self.validation_exceptions as exception:
             current_app.logger.exception(str(exception))
             return self._handle_validation_exception(exception)

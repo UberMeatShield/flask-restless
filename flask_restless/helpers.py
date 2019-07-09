@@ -656,6 +656,18 @@ class UrlFinder(Singleton):
         raise ValueError(message)
 
 
+# This is a SCWX Hack to try and handle disconnecting sessions, the current implementation
+# does not do a good job reseting connections if they timeout or go stale
+SESSION = None
+def get_session():
+    global SESSION
+    return SESSION
+
+def set_session(session):
+    global SESSION
+    SESSION = session
+
+
 #: Returns the URL for the specified model, similar to :func:`flask.url_for`.
 #:
 #: `model` is a SQLAlchemy model class. This should be a model on which
