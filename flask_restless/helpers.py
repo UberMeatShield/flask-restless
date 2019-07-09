@@ -656,8 +656,8 @@ class UrlFinder(Singleton):
         raise ValueError(message)
 
 
-# This is a SCWX Hack to try and handle disconnecting sessions, the current implementation
-# does not do a good job reseting connections if they timeout or go stale
+# Provide a means of getting a hold of the current session (or create it perhaps) so that
+# we can reset stale sessions in a long running process.
 SESSION = None
 def get_session():
     global SESSION
